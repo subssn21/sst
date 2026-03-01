@@ -1336,6 +1336,28 @@ export interface FunctionArgs {
    */
   layers?: Input<Input<string>[]>;
   /**
+   * Deploy shared dependencies as a Lambda Layer instead of bundling
+   * them into each function's zip package. When multiple functions share
+   * the same dependencies, they automatically share a single layer.
+   *
+   * This is useful for projects with many functions that use the same
+   * dependency set — it reduces deploy time and storage by building
+   * dependencies once.
+   *
+   * :::note
+   * Layers are not used in `sst dev` or container mode.
+   * :::
+   *
+   * @default `false`
+   * @example
+   * ```js
+   * {
+   *   dependencyLayer: true
+   * }
+   * ```
+   */
+  dependencyLayer?: Input<boolean>;
+  /**
    * Mount an EFS file system to the function.
    *
    * @example
@@ -1733,12 +1755,13 @@ export class Function extends Component implements Link.Linkable {
 
     const linkData = buildLinkData();
     const linkPermissions = buildLinkPermissions();
-    const { bundle, handler: handler0, sourcemaps } = buildHandler();
+    const { bundle, handler: handler0, sourcemaps, layers: buildLayers } = buildHandler();
     const { handler, wrapper } = buildHandlerWrapper();
     const role = createRole();
     const imageAsset = createImageAsset();
     const logGroup = createLogGroup();
     const zipAsset = createZipAsset();
+    const dependencyLayers = createDependencyLayers();
     const fn = createFunction();
     const urlEndpoint = createUrl();
     createProvisioned();
@@ -1767,6 +1790,9 @@ export class Function extends Component implements Link.Linkable {
         (val) => ({
           ...(val.nodejs || val.python),
           architecture,
+          dependencyLayer: all([args.dependencyLayer, isContainer, dev]).apply(
+            ([dl, container, isDev]) => !isDev && !container && (dl ?? false),
+          ),
         }),
       ),
       dev,
@@ -2011,6 +2037,9 @@ export class Function extends Component implements Link.Linkable {
             return {
               handler: "bootstrap",
               bundle: path.join($cli.paths.platform, "dist", "bridge"),
+              layers: undefined as
+                | Array<{ dir: string; hash: string; description: string }>
+                | undefined,
             };
           }
 
@@ -2020,6 +2049,7 @@ export class Function extends Component implements Link.Linkable {
               out: string;
               errors: string[];
               sourcemaps: string[];
+              layers?: Array<{ dir: string; hash: string; description: string }>;
             }>("Runtime.Build", { ...input, isContainer });
             if (result.errors.length > 0) {
               throw new Error(result.errors.join("\n"));
@@ -2028,10 +2058,13 @@ export class Function extends Component implements Link.Linkable {
             return result;
           });
 
+          const resolvedLayers = buildResult.apply((r) => r.layers);
+
           return {
             handler: buildResult.handler,
             bundle: buildResult.out,
             sourcemaps: buildResult.sourcemaps,
+            layers: resolvedLayers,
           };
         },
       );
@@ -2437,6 +2470,35 @@ export class Function extends Component implements Link.Linkable {
       );
     }
 
+    function createDependencyLayers() {
+      return all([buildLayers]).apply(([layers]) => {
+        if (!layers?.length) return [];
+
+        return layers.map((layer) => {
+          const existing = layersByHash.get(layer.hash);
+          if (existing) return existing;
+
+          const layerVersion = new lambda.LayerVersion(
+            `${name}DepLayer${layer.hash.substring(0, 8)}`,
+            {
+              layerName: physicalName(
+                64,
+                `${name}-deps-${layer.hash.substring(0, 8)}`,
+              ),
+              compatibleRuntimes: [runtime],
+              compatibleArchitectures: [architecture],
+              code: new asset.FileArchive(layer.dir),
+              description: layer.description,
+            },
+            { parent },
+          );
+
+          layersByHash.set(layer.hash, layerVersion);
+          return layerVersion;
+        });
+      });
+    }
+
     function createLogGroup() {
       return logging.apply((logging) => {
         if (!logging) return;
@@ -2481,6 +2543,26 @@ export class Function extends Component implements Link.Linkable {
           // There is an unresolved bug in pulumi that causes issues when it does
           // @ts-expect-error
           handler.allResources = () => Promise.resolve(new Set());
+
+          // Validate total layer count does not exceed Lambda's 5-layer limit
+          all([args.layers, dependencyLayers]).apply(
+            ([userLayers, depLayers]) => {
+              const userCount = userLayers?.length ?? 0;
+              const depCount = depLayers.length;
+              const totalLayers = userCount + depCount;
+              if (totalLayers > 5) {
+                throw new VisibleError(
+                  `Function "${name}" has ${totalLayers} layers (${userCount} user + ${depCount} dependency), ` +
+                    `but Lambda allows a maximum of 5. Remove some layers or disable dependencyLayer.`,
+                );
+              }
+            },
+          );
+
+          // Note: The 250MB combined unzipped size limit (function code + layers)
+          // is validated by AWS at deploy time, as unzipped sizes are not available
+          // during the Pulumi planning phase.
+
           const transformed = transform(
             args.transform?.function,
             `${name}Function`,
@@ -2507,7 +2589,12 @@ export class Function extends Component implements Link.Linkable {
                 arn: volume.efs,
                 localMountPath: volume.path,
               },
-              layers: args.layers,
+              layers: all([args.layers, dependencyLayers]).apply(
+                ([userLayers, depLayers]) => {
+                  const depArns = depLayers.map((l) => l.arn);
+                  return [...(userLayers ?? []), ...depArns];
+                },
+              ),
               tags: args.tags,
               publish: output(args.versioning).apply((v) => v ?? false),
               reservedConcurrentExecutions: concurrency?.reserved,
@@ -2884,6 +2971,9 @@ export class Function extends Component implements Link.Linkable {
     };
   }
 }
+
+// Module-level dedup map (shared across all Function instances in one deploy)
+const layersByHash = new Map<string, lambda.LayerVersion>();
 
 const __pulumiType = "sst:aws:Function";
 // @ts-expect-error

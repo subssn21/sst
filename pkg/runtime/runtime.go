@@ -70,11 +70,22 @@ func (input *BuildInput) Out() string {
 	return filepath.Join(path.ResolveWorkingDir(input.CfgPath), "artifacts", input.FunctionID+suffix)
 }
 
+// LayerOutput describes a single layer produced by a runtime build.
+type LayerOutput struct {
+	// Dir is the absolute path to the layer content directory.
+	Dir string `json:"dir"`
+	// Hash is a content-addressable fingerprint for deduplication.
+	Hash string `json:"hash"`
+	// Description is a human-readable label for the layer.
+	Description string `json:"description"`
+}
+
 type BuildOutput struct {
-	Out        string   `json:"out"`
-	Handler    string   `json:"handler"`
-	Errors     []string `json:"errors"`
-	Sourcemaps []string `json:"sourcemaps"`
+	Out        string        `json:"out"`
+	Handler    string        `json:"handler"`
+	Errors     []string      `json:"errors"`
+	Sourcemaps []string      `json:"sourcemaps"`
+	Layers     []LayerOutput `json:"layers,omitempty"`
 }
 
 type RunInput struct {

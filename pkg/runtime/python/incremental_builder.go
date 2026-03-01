@@ -269,6 +269,23 @@ type PackageBuildInfo struct {
 	CacheKey string
 }
 
+// LayerInfo carries dependency layer metadata from copySyncedDependencies
+// back to createFinalBuildOutput so it can populate BuildOutput.Layers.
+type LayerInfo struct {
+	// BaseDir is the layer root directory (e.g., .layers/{cacheKey}/)
+	// containing the python/lib/pythonX.Y/site-packages/ structure.
+	BaseDir string
+
+	// Fingerprint is the content-addressable hash for deduplication.
+	Fingerprint string
+
+	// RuntimeVersion is the Python runtime version (e.g., "python3.13").
+	RuntimeVersion string
+
+	// Architecture is the target CPU architecture (e.g., "x86_64" or "arm64").
+	Architecture string
+}
+
 // BuildResult represents the result of an incremental build
 type BuildResult struct {
 	// Success indicates if the build was successful
@@ -300,6 +317,10 @@ type BuildResult struct {
 
 	// DependencyAnalysis caches the dependency analysis to avoid re-analyzing
 	DependencyAnalysis *DependencyAnalysis
+
+	// LayerInfo contains dependency layer metadata when dependencyLayer is enabled.
+	// Nil when dependencyLayer is false or in dev/container mode.
+	LayerInfo *LayerInfo
 }
 
 // NewIncrementalBuilder creates a new incremental builder with the given configuration
@@ -1078,12 +1099,23 @@ func (ib *IncrementalBuilder) createFinalBuildOutput(ctx context.Context, input 
 
 	result.CachedBuildOutput = cachedBuildOutput
 
-	return &runtime.BuildOutput{
+	output := &runtime.BuildOutput{
 		Out:        input.Out(),
 		Handler:    adjustedHandler,
 		Errors:     result.Errors,
 		Sourcemaps: []string{}, // TODO: collect sourcemaps
-	}, nil
+	}
+
+	// Populate Layers when dependencyLayer produced layer info
+	if result.LayerInfo != nil && result.LayerInfo.BaseDir != "" {
+		output.Layers = []runtime.LayerOutput{{
+			Dir:         result.LayerInfo.BaseDir,
+			Hash:        result.LayerInfo.Fingerprint,
+			Description: fmt.Sprintf("%s-%s dependencies", result.LayerInfo.RuntimeVersion, result.LayerInfo.Architecture),
+		}}
+	}
+
+	return output, nil
 }
 
 // ensureDockerfile ensures a Dockerfile exists in the output directory for container builds.
@@ -1906,9 +1938,13 @@ func (ib *IncrementalBuilder) installDependenciesForBuild(ctx context.Context, i
 	// Install dependencies for the correct target platform (Linux)
 	ib.progressReporter.UpdateProgress(StageBuildPackages, "Installing dependencies for Lambda")
 
-	if err := ib.installDependenciesForLambda(ctx, input, projectInfo, requirementsFile, architecture); err != nil {
+	layerInfo, err := ib.installDependenciesForLambda(ctx, input, projectInfo, requirementsFile, architecture)
+	if err != nil {
 		return fmt.Errorf("failed to install dependencies: %w", err)
 	}
+
+	// Store layer info on the build result for createFinalBuildOutput to use
+	result.LayerInfo = layerInfo
 
 	return nil
 }
@@ -2106,8 +2142,9 @@ func (ib *IncrementalBuilder) sortRequirementsFile(filePath string) error {
 
 // InputProperties represents the input properties structure
 type InputProperties struct {
-	Architecture string `json:"architecture"`
-	Container    bool   `json:"container"`
+	Architecture    string `json:"architecture"`
+	Container       bool   `json:"container"`
+	DependencyLayer bool   `json:"dependencyLayer"`
 }
 
 // parseInputProperties parses the input properties JSON
@@ -2118,6 +2155,124 @@ func (ib *IncrementalBuilder) parseInputProperties(input *runtime.BuildInput) (*
 	}
 
 	return &props, nil
+}
+
+// computeLayerFingerprint computes a SHA-256 fingerprint from the requirements hash,
+// runtime version, architecture, and workspace source hash. This is used to deduplicate
+// dependency layers across functions that share the same dependency set.
+// The workspaceSourceHash ensures the fingerprint changes when workspace package source
+// files change, even if requirements.txt hasn't changed.
+func computeLayerFingerprint(requirementsHash, runtimeVersion, architecture, workspaceSourceHash string) string {
+	h := sha256.New()
+	h.Write([]byte(requirementsHash))
+	h.Write([]byte(runtimeVersion))
+	h.Write([]byte(architecture))
+	h.Write([]byte(workspaceSourceHash))
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// hashWorkspacePackageSources computes a combined SHA-256 hash of all Python source files
+// in workspace package directories referenced by requirements.txt. This is used to bust
+// the dependency cache when workspace package source files change, even though the
+// requirements.txt itself hasn't changed (since it only contains paths like ./backend_pkg).
+func (ib *IncrementalBuilder) hashWorkspacePackageSources(requirementsPath, workspaceRoot string) string {
+	content, err := os.ReadFile(requirementsPath)
+	if err != nil {
+		slog.Warn("failed to read requirements for workspace source hashing", "error", err)
+		return ""
+	}
+
+	// Collect local path references from requirements.txt
+	var localPaths []string
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Strip -e prefix for editable installs
+		if strings.HasPrefix(line, "-e ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "-e "))
+		}
+		// Match local path references (./path, ../path)
+		if strings.HasPrefix(line, "./") || strings.HasPrefix(line, "../") {
+			localPaths = append(localPaths, line)
+		}
+	}
+
+	if len(localPaths) == 0 {
+		return ""
+	}
+
+	h := sha256.New()
+	totalFiles := 0
+
+	for _, localPath := range localPaths {
+		fullPath := filepath.Join(workspaceRoot, localPath)
+		// Resolve to absolute path for consistent walking
+		absPath, err := filepath.Abs(fullPath)
+		if err != nil {
+			slog.Debug("failed to resolve workspace package path", "path", fullPath, "error", err)
+			continue
+		}
+
+		info, err := os.Stat(absPath)
+		if err != nil || !info.IsDir() {
+			slog.Debug("workspace package path not found or not a directory", "path", absPath)
+			continue
+		}
+
+		// Collect all .py files sorted for deterministic hashing
+		var pyFiles []string
+		filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil // skip errors
+			}
+			// Skip __pycache__, .git, .venv, node_modules, .egg-info dirs
+			if info.IsDir() {
+				base := filepath.Base(path)
+				if base == "__pycache__" || base == ".git" || base == ".venv" ||
+					base == "node_modules" || strings.HasSuffix(base, ".egg-info") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if strings.HasSuffix(path, ".py") {
+				// Use relative path for determinism across machines
+				relPath, err := filepath.Rel(absPath, path)
+				if err != nil {
+					relPath = path
+				}
+				pyFiles = append(pyFiles, relPath)
+			}
+			return nil
+		})
+
+		sort.Strings(pyFiles)
+
+		for _, relFile := range pyFiles {
+			fullFile := filepath.Join(absPath, relFile)
+			f, err := os.Open(fullFile)
+			if err != nil {
+				continue
+			}
+			// Write the relative path as a separator so renames are detected
+			h.Write([]byte(relFile))
+			io.Copy(h, f)
+			f.Close()
+			totalFiles++
+		}
+	}
+
+	if totalFiles == 0 {
+		return ""
+	}
+
+	hash := fmt.Sprintf("%x", h.Sum(nil))
+	slog.Info("computed workspace source hash",
+		"localPaths", localPaths,
+		"totalFiles", totalFiles,
+		"hash", hash[:16])
+	return hash
 }
 
 // cleanupAbsolutePaths removes any directories with absolute paths from the artifact directory
@@ -2158,7 +2313,8 @@ func (ib *IncrementalBuilder) cleanupAbsolutePaths(artifactDir string) error {
 }
 
 // installDependenciesForLambda installs dependencies for Lambda with correct platform targeting
-func (ib *IncrementalBuilder) installDependenciesForLambda(ctx context.Context, input *runtime.BuildInput, projectInfo *ProjectInfo, requirementsFile string, architecture string) error {
+// Returns LayerInfo when dependencyLayer is enabled, nil otherwise.
+func (ib *IncrementalBuilder) installDependenciesForLambda(ctx context.Context, input *runtime.BuildInput, projectInfo *ProjectInfo, requirementsFile string, architecture string) (*LayerInfo, error) {
 	workspaceDir := projectInfo.SourceRoot
 	if projectInfo.PyprojectPath != "" {
 		workspaceDir = filepath.Dir(projectInfo.PyprojectPath)
@@ -2175,18 +2331,19 @@ func (ib *IncrementalBuilder) installDependenciesForLambda(ctx context.Context, 
 	slog.Info("copying source files based on handler path", "handler", input.Handler)
 
 	if err := ib.copySourceFilesSimple(ctx, input, projectInfo); err != nil {
-		return fmt.Errorf("failed to copy source files: %w", err)
+		return nil, fmt.Errorf("failed to copy source files: %w", err)
 	}
 
 	// Copy the synced packages from .venv to output directory
 	// This includes git dependencies like sst that are properly resolved after sync
 	ib.progressReporter.UpdateProgress(StageBuildPackages, "Copying synced dependencies")
 
-	if err := ib.copySyncedDependencies(ctx, input, projectInfo, architecture); err != nil {
-		return fmt.Errorf("failed to copy synced dependencies: %w", err)
+	layerInfo, err := ib.copySyncedDependencies(ctx, input, projectInfo, architecture)
+	if err != nil {
+		return nil, fmt.Errorf("failed to copy synced dependencies: %w", err)
 	}
 
-	return nil
+	return layerInfo, nil
 }
 
 // copySourceFilesSimple copies source files using a simple, handler-path-based approach
@@ -2464,9 +2621,22 @@ func (ib *IncrementalBuilder) containsPythonContent(dirPath string) bool {
 }
 
 // copySyncedDependencies installs all dependencies (external + workspace packages) with correct platform targeting
-func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input *runtime.BuildInput, projectInfo *ProjectInfo, architecture string) error {
+// When dependencyLayer is enabled, deps are installed into a Lambda layer directory structure
+// instead of the flat .deps/ cache, and are NOT copied into the function artifact.
+// Returns LayerInfo when dependencyLayer is enabled, nil otherwise.
+func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input *runtime.BuildInput, projectInfo *ProjectInfo, architecture string) (*LayerInfo, error) {
 	startTime := time.Now()
 	slog.Info("⏱️ copySyncedDependencies START", "functionID", input.FunctionID)
+
+	// Parse input properties to check dependencyLayer flag
+	dependencyLayer := false
+	if props, err := ib.parseInputProperties(input); err == nil {
+		dependencyLayer = props.DependencyLayer
+	}
+	// Never use dependency layers in dev mode
+	if input.Dev {
+		dependencyLayer = false
+	}
 
 	// Use the requirements.txt that was already exported by the export step
 	// With --no-editable, workspace packages appear as ./path instead of -e ./path
@@ -2476,7 +2646,7 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 	// Check if requirements.txt exists
 	if _, err := os.Stat(requirementsPath); os.IsNotExist(err) {
 		slog.Warn("requirements.txt not found, skipping dependency installation", "path", requirementsPath)
-		return nil
+		return nil, nil
 	}
 
 	// Get workspace root directory - find the UV workspace root (pyproject.toml with [tool.uv.workspace])
@@ -2513,18 +2683,39 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 	filteredRequirementsPath := filepath.Join(input.Out(), "requirements-filtered.txt")
 	_, err := ib.filterWorkspacePackagesFromRequirementsAndGetPaths(requirementsPath, filteredRequirementsPath, projectInfo, workspaceRoot)
 	if err != nil {
-		return fmt.Errorf("failed to filter requirements: %w", err)
+		return nil, fmt.Errorf("failed to filter requirements: %w", err)
 	}
 	requirementsPath = filteredRequirementsPath
 
-	// Calculate cache key from requirements hash + architecture
+	// Calculate cache key from requirements hash + workspace source hash + architecture
+	// The workspace source hash ensures the cache busts when workspace package source files
+	// change, even if requirements.txt hasn't changed (it only contains paths like ./backend_pkg)
 	requirementsHash, err := ib.hashFile(requirementsPath)
+	workspaceSourceHash := ib.hashWorkspacePackageSources(requirementsPath, workspaceRoot)
 	var cacheKey string
 	var depsCacheDir string
+	var layerBaseDir string // set when dependencyLayer is true
 
 	if err == nil {
-		cacheKey = fmt.Sprintf("%s-%s", requirementsHash, architecture)
-		depsCacheDir = filepath.Join(filepath.Dir(input.Out()), ".deps", cacheKey)
+		if workspaceSourceHash != "" {
+			cacheKey = fmt.Sprintf("%s-%s-%s", requirementsHash, workspaceSourceHash[:16], architecture)
+		} else {
+			cacheKey = fmt.Sprintf("%s-%s", requirementsHash, architecture)
+		}
+
+		if dependencyLayer {
+			// When dependencyLayer is enabled, install into Lambda layer directory structure
+			// instead of the flat .deps/ cache. Same cache key, different layout.
+			runtimeVersion := input.Runtime // already "python3.13" format
+			layerBaseDir = filepath.Join(filepath.Dir(input.Out()), ".layers", cacheKey)
+			depsCacheDir = filepath.Join(layerBaseDir, "python", "lib", runtimeVersion, "site-packages")
+			slog.Info("dependency layer enabled, using layer directory",
+				"layerBaseDir", layerBaseDir,
+				"depsCacheDir", depsCacheDir,
+				"cacheKey", cacheKey)
+		} else {
+			depsCacheDir = filepath.Join(filepath.Dir(input.Out()), ".deps", cacheKey)
+		}
 
 		// Log cache key for debugging
 		if data, err := os.ReadFile(requirementsPath); err == nil {
@@ -2561,13 +2752,13 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 			}
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("context cancelled while waiting for dependency install lock")
+				return nil, fmt.Errorf("context cancelled while waiting for dependency install lock")
 			case <-time.After(500 * time.Millisecond):
 				// Try again
 			}
 		}
 		if !gotLock {
-			return fmt.Errorf("timed out waiting for dependency install lock after 5 minutes")
+			return nil, fmt.Errorf("timed out waiting for dependency install lock after 5 minutes")
 		}
 		defer cacheLock.Unlock()
 		ib.progressReporter.UpdateProgress(StageBuildPackages, "✅ Got install lock")
@@ -2577,6 +2768,24 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 			slog.Info("disk cache hit", "depsCacheDir", depsCacheDir, "entries", len(entries))
 			ib.progressReporter.UpdateProgress(StageBuildPackages, "⚡ CACHE HIT! Copying from disk cache...")
 
+			if dependencyLayer {
+				// When dependencyLayer is enabled, deps stay in the layer dir — no copy to artifact
+				// But first, resolve any .pth files that may exist from older cached builds
+				if err := ib.resolvePthFilesInPlace(depsCacheDir); err != nil {
+					slog.Warn("failed to resolve .pth files in cached layer", "error", err)
+				}
+				totalDuration := time.Since(startTime)
+				slog.Info("✅ copySyncedDependencies COMPLETE (layer cache hit)", "functionID", input.FunctionID, "elapsed", totalDuration)
+				ib.progressReporter.UpdateProgress(StageBuildPackages, fmt.Sprintf("✅ Layer cache hit (%v)", totalDuration))
+				fingerprint := computeLayerFingerprint(requirementsHash, input.Runtime, architecture, workspaceSourceHash)
+				return &LayerInfo{
+					BaseDir:        layerBaseDir,
+					Fingerprint:    fingerprint,
+					RuntimeVersion: input.Runtime,
+					Architecture:   architecture,
+				}, nil
+			}
+
 			if err := ib.copyDependencyPackages(depsCacheDir, input.Out()); err != nil {
 				slog.Warn("failed to copy from disk cache, will reinstall", "error", err)
 				// Remove bad cache and continue to reinstall
@@ -2585,14 +2794,14 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 				totalDuration := time.Since(startTime)
 				slog.Info("✅ copySyncedDependencies COMPLETE (disk cache hit)", "functionID", input.FunctionID, "elapsed", totalDuration)
 				ib.progressReporter.UpdateProgress(StageBuildPackages, fmt.Sprintf("✅ Copied from cache (%v)", totalDuration))
-				return nil
+				return nil, nil
 			}
 		}
 
 		// Cache miss - create the cache directory
 		ib.progressReporter.UpdateProgress(StageBuildPackages, "📦 CACHE MISS - Installing dependencies...")
 		if err := os.MkdirAll(depsCacheDir, 0755); err != nil {
-			return fmt.Errorf("failed to create deps cache directory: %w", err)
+			return nil, fmt.Errorf("failed to create deps cache directory: %w", err)
 		}
 		slog.Info("using dedicated deps cache directory", "depsCacheDir", depsCacheDir, "cacheKey", cacheKey)
 	} else {
@@ -2742,7 +2951,7 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 		if cacheKey != "" {
 			os.RemoveAll(depsCacheDir)
 		}
-		return fmt.Errorf("uv pip install timed out after 15 minutes - check network connectivity and try again")
+		return nil, fmt.Errorf("uv pip install timed out after 15 minutes - check network connectivity and try again")
 	}
 
 	if err != nil {
@@ -2758,7 +2967,7 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 		if cacheKey != "" {
 			os.RemoveAll(depsCacheDir)
 		}
-		return fmt.Errorf("failed to run uv pip install: %v\n%s\n\nFunction: %s\nHandler: %s\nWorking directory: %s\nPyproject path: %s",
+		return nil, fmt.Errorf("failed to run uv pip install: %v\n%s\n\nFunction: %s\nHandler: %s\nWorking directory: %s\nPyproject path: %s",
 			err, string(installOutput), input.FunctionID, input.Handler, installWorkspaceDir, projectInfo.PyprojectPath)
 	}
 
@@ -2772,8 +2981,21 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 	}
 
 	// Copy dependencies from cache directory to function artifact
-	if err := ib.copyDependencyPackages(depsCacheDir, input.Out()); err != nil {
-		return fmt.Errorf("failed to copy dependencies to artifact: %w", err)
+	// When dependencyLayer is enabled, deps stay in the layer dir only — skip copy to artifact
+	if !dependencyLayer {
+		if err := ib.copyDependencyPackages(depsCacheDir, input.Out()); err != nil {
+			return nil, fmt.Errorf("failed to copy dependencies to artifact: %w", err)
+		}
+	} else {
+		// When dependencyLayer is enabled, resolve .pth files in-place within the layer directory.
+		// uv pip install creates .pth files for workspace packages (e.g., _sst_sdk.pth pointing
+		// to /Users/.../sst_sdk) instead of copying the actual source. These local paths don't
+		// exist on Lambda, so we need to resolve them: copy the actual package source into the
+		// layer directory and remove the .pth file.
+		if err := ib.resolvePthFilesInPlace(depsCacheDir); err != nil {
+			slog.Warn("failed to resolve .pth files in layer directory", "error", err)
+			// Don't fail the build — the layer will still work for non-workspace packages
+		}
 	}
 
 	// Clean up the filtered requirements file
@@ -2783,7 +3005,18 @@ func (ib *IncrementalBuilder) copySyncedDependencies(ctx context.Context, input 
 	slog.Info("✅ copySyncedDependencies COMPLETE (fresh install)", "functionID", input.FunctionID, "elapsed", totalDuration)
 	ib.progressReporter.UpdateProgress(StageBuildPackages, fmt.Sprintf("✅ Installed dependencies (%v)", totalDuration))
 
-	return nil
+	// Return layer info when dependencyLayer is enabled
+	if dependencyLayer && cacheKey != "" {
+		fingerprint := computeLayerFingerprint(requirementsHash, input.Runtime, architecture, workspaceSourceHash)
+		return &LayerInfo{
+			BaseDir:        layerBaseDir,
+			Fingerprint:    fingerprint,
+			RuntimeVersion: input.Runtime,
+			Architecture:   architecture,
+		}, nil
+	}
+
+	return nil, nil
 }
 
 // filterWorkspacePackagesFromRequirementsAndGetPaths filters out workspace packages from requirements.txt
@@ -3519,5 +3752,95 @@ func (ib *IncrementalBuilder) copyDependencyPackages(srcDir, destDir string) err
 	}
 
 	slog.Info("copied dependency packages", "directories", copiedCount, "rootFiles", copiedFiles, "pthPackages", copiedPthPackages)
+	return nil
+}
+
+// resolvePthFilesInPlace finds .pth files in a directory, copies the actual package source
+// they reference into the same directory, and removes the .pth files.
+// This is needed for dependency layers because uv pip install --target creates .pth files
+// for workspace packages that point to local machine paths (e.g., /Users/.../sst_sdk),
+// which don't exist on Lambda.
+func (ib *IncrementalBuilder) resolvePthFilesInPlace(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("failed to read directory: %w", err)
+	}
+
+	resolved := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".pth") || name == "distutils-precedence.pth" {
+			continue
+		}
+
+		pthPath := filepath.Join(dir, name)
+		pthContent, err := os.ReadFile(pthPath)
+		if err != nil {
+			slog.Warn("failed to read .pth file", "file", name, "error", err)
+			continue
+		}
+
+		packageSourcePath := strings.TrimSpace(string(pthContent))
+		if packageSourcePath == "" {
+			continue
+		}
+
+		// Extract package name from .pth filename (e.g., "_sst_sdk.pth" -> "sst_sdk")
+		pthBaseName := strings.TrimSuffix(name, ".pth")
+		packageName := strings.TrimPrefix(pthBaseName, "_")
+
+		// Find the actual package directory within the source path
+		var packageDir string
+
+		// First, check if there's a directory matching the package name
+		candidatePath := filepath.Join(packageSourcePath, packageName)
+		if info, err := os.Stat(candidatePath); err == nil && info.IsDir() {
+			packageDir = candidatePath
+		} else {
+			// Try pyproject.toml to find the package location (e.g., hatch build targets)
+			pyprojectPath := filepath.Join(packageSourcePath, "pyproject.toml")
+			if _, err := os.Stat(pyprojectPath); err == nil {
+				if config, err := ib.projectResolver.ParsePyprojectToml(pyprojectPath); err == nil {
+					if len(config.Tool.Hatch.Build.Targets.Wheel.Packages) > 0 {
+						pkgName := config.Tool.Hatch.Build.Targets.Wheel.Packages[0]
+						candidatePath = filepath.Join(packageSourcePath, pkgName)
+						if info, err := os.Stat(candidatePath); err == nil && info.IsDir() {
+							packageDir = candidatePath
+							packageName = pkgName
+						}
+					}
+				}
+			}
+		}
+
+		if packageDir == "" {
+			slog.Warn("could not find package directory for .pth file",
+				"pthFile", name,
+				"packageSourcePath", packageSourcePath,
+				"packageName", packageName)
+			continue
+		}
+
+		// Copy the actual package into the layer directory
+		destPath := filepath.Join(dir, packageName)
+		slog.Info("resolving .pth file in layer",
+			"pthFile", name,
+			"packageName", packageName,
+			"source", packageDir,
+			"dest", destPath)
+
+		if err := ib.copyDirectory(packageDir, destPath); err != nil {
+			slog.Warn("failed to copy package from .pth", "package", packageName, "error", err)
+			continue
+		}
+
+		// Remove the .pth file — it's no longer needed
+		os.Remove(pthPath)
+		resolved++
+	}
+
+	if resolved > 0 {
+		slog.Info("resolved .pth files in layer directory", "count", resolved)
+	}
 	return nil
 }
